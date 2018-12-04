@@ -10,16 +10,15 @@ import (
 	"strings"
 	"time"
 
-	// gx managed packages
-	"gx/ipfs/QmR8BauakNcBa3RbE4nbQu76PDiJgoQgz8AJdhJuiU4TAw/go-cid"
-	"gx/ipfs/QmRKbEchaYADxSCyyjhDh4cTrUby8ftXUb8MRLBTHQYupw/go-libp2p-net"
-	"gx/ipfs/QmUSE3APe1pMFVsUBZUZaKQKERiPteCWvTAERtVQmtXzgE/go-ipfs-addr"
-	"gx/ipfs/QmUymf8fJtideyv3z727BcZUifGBjMZMpCJqu3Gxk5aRUk/go-libp2p-peerstore"
-	"gx/ipfs/QmVrjR2KMe57y4YyfHdYa3yKD278gN8W7CTiqSuYmxjA7F/go-libp2p-host"
-	"gx/ipfs/QmXnpYYg2onGLXVxM4Q5PEFcx29k8zeJQkPeLAk9h9naxg/go-libp2p"
-	"gx/ipfs/QmadRyQYRn64xHb5HKy2jRFp2Der643Cgo7NEjFgs4MX2k/go-libp2p-kad-dht"
-	"gx/ipfs/QmcqU6QUDSXprb1518vYDGczrTJTyGwLG9eUa5iNX4xUtS/go-libp2p-peer"
-	"gx/ipfs/QmerPMzPk1mJVowm8KgmoknWa4yCYvvugMPsgWmDNUvDLW/go-multihash"
+	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-ipfs-addr"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-host"
+	"github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p-net"
+	"github.com/libp2p/go-libp2p-peer"
+	"github.com/libp2p/go-libp2p-peerstore"
+	"github.com/multiformats/go-multihash"
 )
 
 // IPFS bootstrap nodes. Used to find other peers in the network.
@@ -56,8 +55,10 @@ func commandUsageInit() {
 	cmdUsage = make(map[string]string)
 
 	cmdUsage["chat"] = "\\chat"
+	cmdUsage["con"] = "\\con"
 	cmdUsage["connections"] = "\\connections"
 	cmdUsage["peer"] = "\\peer <peer.ID Qm*...>"
+	cmdUsage["addpeer"] = "\\addpeer <peer.ID Qm*...>"
 	cmdUsage["quit"] = "\\quit"
 }
 
@@ -79,8 +80,14 @@ func executeCommand(commandline string) {
 		case "connections":
 			chatConnections(commandFields[1:])
 
+		case "con":
+			chatConNum(commandFields[1:])
+
 		case "peer":
 			chatPeer(commandFields[1:])
+
+		case "addpeer":
+			addPeer(commandFields[1:])
 
 		case "quit":
 			quitChat(commandFields[1:])
@@ -108,10 +115,26 @@ func chatHost(arguments []string) {
 }
 
 // chatConnections shows all connected peers of both directions
+// or only write connections if first arg has "w" as prefix
+// or only read connections if first arg has "r" as prefix
 func chatConnections(arguments []string) {
 
-	// Get rid of warning
-	_ = arguments
+	if len(arguments) != 0 {
+		if strings.HasPrefix(arguments[0], "w") {
+			for i, wPeer := range writeToPeers {
+				fmt.Printf("<WRITE_CONNECTIONS>: %d: %s\n", i, wPeer)
+			}
+			fmt.Print(chat.ID(), " ")
+			return
+		}
+		if strings.HasPrefix(arguments[0], "r") {
+			for i, rPeer := range readFromPeers {
+				fmt.Printf("<READ_CONNECTIONS>: %d: %s\n", i, rPeer)
+			}
+			fmt.Print(chat.ID(), " ")
+			return
+		}
+	}
 
 	for i, wPeer := range writeToPeers {
 		fmt.Printf("<WRITE_CONNECTIONS>: %d: %s\n", i, wPeer)
@@ -119,6 +142,17 @@ func chatConnections(arguments []string) {
 	for i, rPeer := range readFromPeers {
 		fmt.Printf("<READ_CONNECTIONS>: %d: %s\n", i, rPeer)
 	}
+	fmt.Print(chat.ID(), " ")
+}
+
+// chatConNum shows the number connected peers of both directions
+func chatConNum(arguments []string) {
+
+	// Get rid of warning
+	_ = arguments
+
+	fmt.Printf("<NUM_CONN>: Inbound: %d Outbound: %d\n",
+		len(readFromPeers), len(writeToPeers))
 	fmt.Print(chat.ID(), " ")
 }
 
@@ -162,6 +196,64 @@ func chatPeer(arguments []string) {
 	}
 }
 
+// addPeer adds a specified peer
+func addPeer(arguments []string) {
+
+	// Check at least two words exists
+	if len(arguments) < 2 {
+		fmt.Printf("ERROR: wrong format: e.g. %q\n", "<peer.ID Qm*YDJjDm>")
+		return
+	}
+
+	// Join the two words of peer ID
+	pIn := strings.Join(arguments[:2], " ")
+
+	// Loop over all peers from the store of the chat
+	for _, p := range chat.Peerstore().Peers() {
+
+		// Search the given ID and print accordingly
+		if p.String() == pIn {
+
+			// Check, if the peer already is known for writing to
+			exists := false
+			for _, writeConnection := range writeToPeers {
+				if writeConnection.Pretty() == p.Pretty() {
+					exists = true
+				}
+			}
+
+			// Create a stream for a new peer
+			if !exists {
+
+				stream, err := chat.NewStream(context.Background(), p, "/chat/1.1.0")
+				if err != nil {
+					log.Printf("ERROR (%s): %v\n", p, err)
+				} else {
+
+					// Add new remote peer as peer to write to
+					writeToPeers = append(writeToPeers, stream.Conn().RemotePeer())
+
+					// Create a buffer stream for non blocking read and write
+					rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+					// Add new buffer to write to
+					readWriters = append(readWriters, rw)
+
+					// Go routine to process stream lines
+					go readData(rw)
+
+					// TODO: Unclear, if we need this Go routine and how many
+					go writeData()
+
+					// Shows the number of saved peers and connections, respectively
+					fmt.Printf("\rInbound Connections: %d Outbound Connections: %d ",
+						len(readFromPeers), len(writeToPeers))
+				}
+			}
+			fmt.Print(chat.ID(), " ")
+		}
+	}
+}
+
 // quitChat does the expected
 func quitChat(arguments []string) {
 
@@ -191,7 +283,7 @@ func handleStream(stream net.Stream) {
 	// Go routine to process stream lines
 	go readData(rw)
 
-	// TODO: Unclear, if we need this Go routine and how many
+	// Go routine to write lines
 	go writeData()
 
 	// Shows the number of saved peers and connections, respectively
@@ -293,6 +385,7 @@ func main() {
 	// Other options can be added here.
 	ctx := context.Background()
 	chat, err = libp2p.New(ctx, libp2p.DisableRelay())
+	//chat, err = libp2p.New(ctx, libp2p.DisableRelay(), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	if err != nil {
 		panic(err)
 	}
@@ -380,7 +473,7 @@ func main() {
 						go readData(rw)
 
 						// TODO: Unclear, if we need this Go routine and how many
-						go writeData()
+						//go writeData()
 
 						// Shows the number of saved peers and connections, respectively
 						fmt.Printf("\rInbound Connections: %d Outbound Connections: %d ",
